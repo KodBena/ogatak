@@ -3,7 +3,14 @@
 <head>
 	<title>Ogatak</title>
 	<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-	<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:;">
+<!--	<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:;"> -->
+    <meta http-equiv="Content-Security-Policy"
+      content="default-src 'self';
+               connect-src 'self' ws://127.0.0.1:41949;
+               script-src 'self';
+                style-src 'self';
+                img-src 'self' data:;">
+
 	<link rel="stylesheet" type="text/css" href="ogatak.css">
 	<script defer src="renderer.js"></script>
 </head>
