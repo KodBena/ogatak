@@ -1,352 +1,259 @@
 "use strict";
 
-// Notes:
-//
-// We only ever have one query active at a time, so we must receive an indication that the
-// previous query has terminated (or at least is terminating) before sending the next one.
-//
-// Our canonical concept of "state" is that the app is trying to ponder if desired != null
-
-const child_process = require("child_process");
 const fs = require("fs");
 const path = require("path");
-const readline = require("readline");
 const {ipcRenderer} = require("electron");
-
 const log = require("./log");
 const stringify = require("./stringify");
 const {translate} = require("./translate");
 const {parse_version, compare_versions} = require("./utils");
 const {new_query, compare_queries} = require("./query");
 
-const bad_versions = [						// Versions of KataGo which are somehow broken.
-	[1, 9, 0],
+const bad_versions = [
+  [1, 9, 0],
 ];
 
 function new_engine(...args) {
-	return new Engine(...args);
+  return new Engine(...args);
 }
 
 class Engine {
+  constructor() {
+    this.is_gtp = false;
+    this.has_quit = false;
 
-	constructor() {
+    this.received_version = false;
+    this.version = [1, 0, 0];
+    this.tuning_in_progress = false;
 
-		this.is_gtp = false;
-		this.has_quit = false;
-		this.exe = null;
+    this.filepath = "";
+    this.engineconfig = "";
+    this.weights = "";
 
-		this.received_version = false;		// Indicates that KataGo has really started responding to commands.
-		this.version = [1, 0, 0];			// Gets updated to something like [1, 9, 0].
-		this.tuning_in_progress = false;
+    this.desired = null;
+    this.running = null;
 
-		this.filepath = "";
-		this.engineconfig = "";
-		this.weights = "";
+    this._ws = null;
+    this._connected = false;
+    this._pending_queue = [];
 
-		// Note that the following will not be null'd just because we receive {isDuringSearch: false}
-		// results, rather they will be left in place to indicate that the app still wants to ponder if
-		// the position changes - which will likely happen immediately as the hub receives the search
-		// results and changes the position based on what play mode it is in (e.g. autoplay, etc).
+    this._ws_url = "ws://127.0.0.1:41949";
+  }
 
-		this.desired = null;				// The search object we want to be running.
-		this.running = null;				// The search object actually running. (Possibly the same object as above.)
-	}
+  __send(o) {
+    if (!o || typeof o !== "object") {
+      throw new Error("__send(): requires an object");
+    }
 
-	__send(o) {
+    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) {
+      this._pending_queue.push(o);
+      if (config && config.logfile) this.log_sent_object(o);
+      return;
+    }
 
-		// Sends the object to the KataGo Analysis Engine by converting it to JSON and writing it to stdin.
+    try {
+      const msg = JSON.stringify(o);
+      this._ws.send(msg);
+      if (config && config.logfile) this.log_sent_object(o);
+    } catch (err) {
+      this.log_and_alert("While sending to engine:", err.toString());
+      this.shutdown();
+    }
+  }
 
-		if (!this.exe) {
-			return;
-		}
-		if (typeof o !== "object" || o === null) {
-			throw new Error("__send(): requires an object");
-		}
-		try {
-			let msg = JSON.stringify(o);
-			this.exe.stdin.write(msg);
-			this.exe.stdin.write("\n");
-			if (config.logfile) {									// This test is just to save effort; the logging function checks this also.
-				this.log_sent_object(o);
-			}
-		} catch (err) {
-			this.log_and_alert("While sending to engine:", err.toString());
-			this.shutdown();
-		}
-	}
+  analyse(node, maxvisits = null, avoid_list = null) {
+    if (!this._connected) return;
 
-	analyse(node, maxvisits = null, avoid_list = null) {
+    const query = new_query(node, this.version, maxvisits, avoid_list);
 
-		// Sets this.desired to be a query for the node.
-		// If a query is currently running, sends a stop message to the engine.
-		// Otherwise, sends the desired query to the engine, and sets this.running.
+    if (this.desired && compare_queries(this.desired, query)) return;
 
-		if (!this.exe) {
-			return;
-		}
+    this.desired = query;
 
-		let query = new_query(node, this.version, maxvisits, avoid_list);
+    if (this.running) {
+      this.__send({
+        id: `stop!${this.running.id}`,
+        action: "terminate",
+        terminateId: `${this.running.id}`
+      });
+    } else {
+      this.__send(this.desired);
+      this.running = this.desired;
+    }
+  }
 
-		if (this.desired) {
-			if (compare_queries(this.desired, query)) {
-				return;												// Everything matches; the search desired is already set as such.
-			}
-		}
+  halt() {
+    this.desired = null;
+    if (this.running) {
+      this.__send({
+        id: `stop!${this.running.id}`,
+        action: "terminate",
+        terminateId: `${this.running.id}`
+      });
+    }
+  }
 
-		this.desired = query;
+  setup(filepath, engineconfig, weights) {
+    if (this._ws || this.has_quit) {
+      throw new Error("setup(): engine object should not be reused");
+    }
 
-		if (this.running) {
-			this.__send({
-				id: `stop!${this.running.id}`,
-				action: "terminate",
-				terminateId: `${this.running.id}`
-			});
-		} else {
-			this.__send(this.desired);
-			this.running = this.desired;
-		}
-	}
+    this.filepath     = fs.existsSync(filepath)     ? filepath     : "";
+    this.engineconfig = fs.existsSync(engineconfig) ? engineconfig : "";
+    this.weights      = fs.existsSync(weights)      ? weights      : "";
 
-	halt() {
+    if (!this.filepath || !this.engineconfig || !this.weights) return;
 
-		// Clears this.desired, and sends a stop message if required.
+    if (process.env.KATAGO_WS_PROXY_URL) {
+      this._ws_url = process.env.KATAGO_WS_PROXY_URL;
+    }
 
-		this.desired = null;
+    this._connect_ws();
+  }
 
-		if (this.running) {
-			this.__send({
-				id: `stop!${this.running.id}`,
-				action: "terminate",
-				terminateId: `${this.running.id}`
-			});
-		}
-	}
+  _connect_ws() {
+    log("");
+    log("-----------------------------------------------------------------------------------");
+    log(`KataGo via proxy at ${this._ws_url}`);
 
-	setup(filepath, engineconfig, weights) {
+    this._ws = new WebSocket(this._ws_url);
 
-		if (this.exe || this.has_quit) {
-			throw new Error("setup(): engine object should not be reused");
-		}
+    this._ws.onopen = () => {
+      this._connected = true;
 
-		this.filepath     = fs.existsSync(filepath)     ? filepath     : "";
-		this.engineconfig = fs.existsSync(engineconfig) ? engineconfig : "";
-		this.weights      = fs.existsSync(weights)      ? weights      : "";
+      while (this._pending_queue.length > 0) {
+        this.__send(this._pending_queue.shift());
+      }
 
-		if (!this.filepath || !this.engineconfig || !this.weights) {
-			return;
-		}
+      this.__send({id: "query_version", action: "query_version"});
+      this.__send({
+        id: "test_bs29",
+        rules: "Chinese",
+        boardXSize: 29,
+        boardYSize: 29,
+        maxVisits: 1,
+        moves: []
+      });
+    };
 
-		try {
-			this.exe = child_process.spawn(
-				this.filepath,
-				["analysis", "-config", this.engineconfig, "-model", this.weights, "-quit-without-waiting"],
-				{cwd: path.dirname(this.filepath)}
-			);
-		} catch (err) {
-			this.log_and_alert("While spawning engine:", err.toString());
-			return;
-		}
+    this._ws.onclose = () => {
+      if (!this.has_quit) {
+        this.log_and_alert("The engine proxy connection appears to have closed.");
+        this.shutdown();
+      }
+    };
 
-		this.finish_setup();
-	}
+    this._ws.onerror = (err) => {
+      this.log_and_alert("Got ws error:", err.toString());
+      this.shutdown();
+    };
 
-	finish_setup() {
+    this._ws.onmessage = (ev) => {
+      if (this.has_quit) return;
 
-		log("");
-		log("-----------------------------------------------------------------------------------");
-		log(`KataGo startup at ${new Date().toUTCString()}`);
+      let o;
+      try {
+        o = JSON.parse(ev.data);
+        if (config && config.logfile) this.log_received_object(o);
+      } catch {
+        this.log_and_alert("Received non-JSON:", ev.data);
+        return;
+      }
 
-		this.exe.once("error", (err) => {
-			this.log_and_alert("Got exe error:", err.toString());
-			this.shutdown();
-		});
+      if (o.id === "test_bs29") {
+        if (!o.error) {
+          this.log_and_alert(
+            "This build of KataGo appears to be compiled with \"bs29\" support. It will be significantly slower."
+          );
+        }
+        return;
+      }
 
-		this.exe.once("exit", (code, signal) => {
-			if (!this.has_quit) {											// Only act if this is unexpected.
-				this.log_and_alert("The engine appears to have quit.");
-				this.shutdown();
-			}
-		});
+      if (o.error) alert("Engine said:\n" + stringify(o));
+      if (o.warning) console.log("Engine warning:", o.warning);
 
-		this.exe.stdin.once("error", (err) => {
-			this.log_and_alert("Got exe.stdin error:", err.toString());
-			this.shutdown();
-		});
+      if (o.action === "query_version" && o.version) {
+        this.version = parse_version(o.version);
+        this.received_version = true;
 
-		this.scanner = readline.createInterface({
-			input: this.exe.stdout,
-			output: undefined,
-			terminal: false
-		});
+        for (let bv of bad_versions) {
+          if (compare_versions(bv, this.version) === 0) {
+            alert(`This exact version of KataGo (${o.version}) is known to crash under Ogatak.`);
+          }
+        }
+      }
 
-		this.err_scanner = readline.createInterface({
-			input: this.exe.stderr,
-			output: undefined,
-			terminal: false
-		});
+      let finished = false;
 
-		this.__send({id: "query_version", action: "query_version"});
-		this.__send({id: "test_bs29", rules: "Chinese", boardXSize: 29, boardYSize: 29, maxVisits: 1, moves: []});
+      if (o.action === "terminate") {
+        if (this.running && this.running.id === o.terminateId) finished = true;
+      }
 
-		this.scanner.on("line", (line) => {
-			if (this.has_quit) {
-				return;
-			}
-			let o;
-			try {
-				o = JSON.parse(line);
-				if (typeof o !== "object" || o === null) {
-					throw new Error("scanner: got non-object");
-				}
-				if (config.logfile) {								// This test is just to save effort; the logging function checks this also.
-					this.log_received_object(o);
-				}
-			} catch (err) {
-				this.log_and_alert("Received non-JSON:", line);
-				return;
-			}
-			if (o.id === "test_bs29") {											// Before the main check for errors.
-				if (!o.error) {
-					this.log_and_alert(
-						"This build of KataGo appears to be compiled with \"bs29\" support for board sizes above 19. " +
-						"This build will be significantly slower. Consider installing the normal version."
-					);
-				}
-				return;
-			}
-			// From here on we don't return early but try to use the object in any event...
-			if (o.error) {
-				alert("Engine said:\n" + stringify(o));
-			}
-			if (o.warning) {
-				console.log("Engine warning: " + o.warning);
-			}
-			if (o.action === "query_version") {
-				this.version = parse_version(o.version);
-				this.received_version = true;
-				for (let bv of bad_versions) {
-					if (compare_versions(bv, this.version) === 0) {
-						alert(`This exact version of KataGo (${o.version}) is known to crash under Ogatak, consider downgrading or upgrading.`);
-					}
-				}
-			}
-			let running_has_finished = false;
-			if (o.action === "terminate") {										// We get these back very quickly upon sending a "terminate", however
-				if (this.running && this.running.id === o.terminateId) {		// Kata may send further updates in a little bit (10-100 ms or so).
-					running_has_finished = true;
-				}
-			}
-			if (o.error) {
-				if (this.running && this.running.id === o.id) {
-					running_has_finished = true;
-				}
-			}
+      if (o.error && this.running && this.running.id === o.id) finished = true;
 
-//			SINCE OGATAK 1.9.6 WE DON'T CARE WHETHER KATAGO ENDED ITS SEARCH
-//			if (o.isDuringSearch === false) {									// Every analysis request generates exactly 1 of these eventually.
-//				if (this.running && this.running.id === o.id) {					// Upon receipt, the search is completely finished.
-//					running_has_finished = true;
-//				}
-//			}
+      if (finished) {
+        if (this.desired === this.running) this.desired = null;
+        this.running = null;
 
-			if (running_has_finished) {
-				if (this.desired === this.running) {
-					this.desired = null;
-				}
-				this.running = null;
-				if (this.desired) {
-					this.__send(this.desired);
-					this.running = this.desired;
-				}
-			}
-			hub.receive_object(o);
-		});
+        if (this.desired) {
+          this.__send(this.desired);
+          this.running = this.desired;
+        }
+      }
 
-		this.err_scanner.on("line", (line) => {
-			if (line.includes("exception")) {
-				alert("KataGo said:\n" + line);
-			}
-			if (this.has_quit) {		// Do this after the above, so that exceptions that caused the quit can be displayed.
-				return;
-			}
-			log("! " + line);
-			if (!line.includes("test_bs29")) {		// These errors are expected.
-				stderrbox.receive(line);
-			}
-			if (line.includes("Beginning GPU tuning") || line.includes("Creating new timing cache")) {
-				this.tuning_in_progress = true;
-				stderrbox.show();
-			}
-			if (line.includes("ready to begin handling requests")) {
-				if (this.tuning_in_progress) {
-					this.tuning_in_progress = false;
-					stderrbox.hide();
-				}
-			}
-		});
-	}
+      try {
+        hub.receive_object(o);
+      } catch (e) {
+        console.error("hub.receive_object error:", e);
+      }
+    };
+  }
 
-	log_received_object(o) {
+  log_received_object(o) {
+    const redacted = {};
+    for (const [k, v] of Object.entries(o)) {
+      redacted[k] = ["moveInfos", "ownership", "policy"].includes(k) ? ["redacted"] : v;
+    }
+    log("< " + JSON.stringify(redacted));
+  }
 
-		let redacted = {};
+  log_sent_object(o) {
+    const redacted = {};
+    for (const [k, v] of Object.entries(o)) {
+      redacted[k] = k === "moves" ? ["redacted"] : v;
+    }
+    log("\n--> " + JSON.stringify(redacted) + "\n");
+  }
 
-		for (let [key, value] of Object.entries(o)) {
-			if (!["moveInfos", "ownership", "policy"].includes(key)) {
-				redacted[key] = value;								// Note this is a shallow copy, so we must not do anything destructive to it.
-			} else {
-				redacted[key] = ["redacted"];
-			}
-		}
+  log_and_alert(...args) {
+    log(args.join(" "));
+    console.log(args.join(" "));
+    alert(args.join("\n"));
+  }
 
-		log("< " + JSON.stringify(redacted));
-	}
+  problem_text() {
+    if (this._connected) return "";
+    if (!this.filepath) return translate("GUI_ENGINE_NOT_SET");
+    if (!this.engineconfig) return translate("GUI_ENGINE_CONFIG_NOT_SET");
+    if (!this.weights) return translate("GUI_WEIGHTS_NOT_SET");
+    return `Engine (${path.basename(this.filepath)}) not running.`;
+  }
 
-	log_sent_object(o) {
+  shutdown() {
+    this.has_quit = true;
 
-		let redacted = {};
+    try {
+      if (this._ws) this._ws.close();
+    } catch {}
 
-		for (let [key, value] of Object.entries(o)) {
-			if (key !== "moves") {
-				redacted[key] = value;								// Note this is a shallow copy, so we must not do anything destructive to it.
-			} else {
-				redacted[key] = ["redacted"];
-			}
-		}
-
-		log("\n--> " + JSON.stringify(redacted) + "\n");
-	}
-
-	log_and_alert(...args) {
-		log(args.join(" "));
-		console.log(args.join(" "));
-		alert(args.join("\n"));
-	}
-
-	problem_text() {
-		if (this.exe) return "";
-		if (!this.filepath) return translate("GUI_ENGINE_NOT_SET");
-		if (!this.engineconfig) return translate("GUI_ENGINE_CONFIG_NOT_SET");
-		if (!this.weights) return translate("GUI_WEIGHTS_NOT_SET");
-		return `Engine (${path.basename(this.filepath)}) not running.`;
-	}
-
-	shutdown() {													// Note: Don't reuse the engine object.
-
-		this.has_quit = true;										// Do this first so we know to ignore the "exit" event generated next...
-		if (this.exe) {
-			try {
-				this.exe.stdin.end();
-				this.exe.kill();
-			} catch (err) {
-				console.log(err);
-			}
-		}
-		this.exe = null;
-		this.running = null;
-		this.desired = null;
-	}
+    this._ws = null;
+    this._connected = false;
+    this._pending_queue = [];
+    this.running = null;
+    this.desired = null;
+  }
 }
 
-
-
 module.exports = new_engine;
+
+
